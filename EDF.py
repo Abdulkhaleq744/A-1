@@ -21,99 +21,104 @@ class Node:
 class Input(Node):
     def forward(self, value=None):
         if value is not None:
-            self.value = value
+            self.value = value.astype(np.float64)
 
     def backward(self):
-        self.gradients = {self: np.zeros_like(self.value)}
-        for n in self.outputs:
-            grad_cost = n.gradients[self]
-            if self.gradients[self].shape != grad_cost.shape:
-                self.gradients[self] = np.zeros_like(grad_cost)
-            self.gradients[self] += grad_cost
+        # Initialize gradients with correct shape
+        self.gradients = {self: np.zeros_like(self.value, dtype=np.float64)}
 
-# Parameter Node
+        # Sum up gradients from all output nodes
+        for n in self.outputs:
+            if self not in n.gradients:
+                continue
+
+            grad_cost = n.gradients[self]
+
+            # Print shapes for debugging
+            # print(f"Gradient shape: {grad_cost.shape}, Expected shape: {self.gradients[self].shape}")
+
+            # Handle different gradient shapes
+            if grad_cost.size == self.gradients[self].size:
+                # If same number of elements, reshape safely
+                grad_cost = grad_cost.reshape(self.gradients[self].shape)
+            elif len(grad_cost.shape) == 1:
+                # If 1D gradient, broadcast to match input shape
+                grad_cost = np.tile(grad_cost[:, np.newaxis], (1, self.gradients[self].shape[1]))
+            elif grad_cost.shape[0] == 1:
+                # If single sample, broadcast to batch size
+                grad_cost = np.tile(grad_cost, (self.gradients[self].shape[0], 1))
+
+            # Ensure the shapes match before adding
+            if self.gradients[self].shape == grad_cost.shape:
+                self.gradients[self] += grad_cost.astype(np.float64)
+            else:
+                # If shapes still don't match, create new gradient array
+                self.gradients[self] = np.zeros_like(grad_cost, dtype=np.float64)
+                self.gradients[self] += grad_cost.astype(np.float64)
+
+
+
 class Parameter(Node):
     def __init__(self, value):
         super().__init__()
-        self.value = value
+        self.value = value.astype(np.float64)
 
     def forward(self):
         pass
 
     def backward(self):
-        self.gradients = {self: np.zeros_like(self.value)}
+        self.gradients = {self: np.zeros_like(self.value, dtype=np.float64)}
         for n in self.outputs:
             self.gradients[self] += n.gradients[self]
 
-# Multiply Node
-class Multiply(Node):
-    def __init__(self, x, y):
-        super().__init__([x, y])
-
-    def forward(self):
-        x, y = self.inputs
-        self.value = x.value * y.value
-
-    def backward(self):
-        x, y = self.inputs
-        self.gradients[x] = self.outputs[0].gradients[self] * y.value
-        self.gradients[y] = self.outputs[0].gradients[self] * x.value
-
-# Addition Node
-class Addition(Node):
-    def __init__(self, x, y):
-        super().__init__([x, y])
-
-    def forward(self):
-        x, y = self.inputs
-        self.value = x.value + y.value
-
-    def backward(self):
-        x, y = self.inputs
-        self.gradients[x] = self.outputs[0].gradients[self]
-        self.gradients[y] = self.outputs[0].gradients[self]
-
-# Sigmoid Activation Node
-class Sigmoid(Node):
-    def __init__(self, node):
-        super().__init__([node])
-
-    def _sigmoid(self, x):
-        return 1 / (1 + np.exp(-x))
-
-    def forward(self):
-        self.value = self._sigmoid(self.inputs[0].value)
-
-    def backward(self):
-        partial = self.value * (1 - self.value)
-        self.gradients[self.inputs[0]] = partial * self.outputs[0].gradients[self]
-
-# Binary Cross Entropy Loss Node
-class BCE(Node):
-    def __init__(self, y_true, y_pred):
-        super().__init__([y_true, y_pred])
-
-    def forward(self):
-        y_true, y_pred = self.inputs
-        self.value = np.sum(-y_true.value * np.log(y_pred.value) - (1 - y_true.value) * np.log(1 - y_pred.value))
-
-    def backward(self):
-        y_true, y_pred = self.inputs
-        self.gradients[y_pred] = (1 / y_true.value.shape[0]) * (y_pred.value - y_true.value) / (y_pred.value * (1 - y_pred.value))
-        self.gradients[y_true] = (1 / y_true.value.shape[0]) * (np.log(y_pred.value) - np.log(1 - y_pred.value))
-
+# Linear Node
 # Linear Node
 class Linear(Node):
     def __init__(self, A, b, x):
         self.A = A
         self.b = b
         self.x = x
-        super().__init__([x])
+        super().__init__([A, b, x])
 
     def forward(self):
-        self.value = np.dot(self.x.value, self.A.value.T) + self.b.value
+        # Handle case where b.value is 1D
+        b_value = self.b.value.reshape(-1, 1) if len(self.b.value.shape) == 1 else self.b.value
+        self.value = np.dot(self.x.value, self.A.value.T) + b_value.T
 
     def backward(self):
         self.gradients[self.A] = np.dot(self.outputs[0].gradients[self].T, self.x.value)
         self.gradients[self.b] = np.sum(self.outputs[0].gradients[self], axis=0)
         self.gradients[self.x] = np.dot(self.outputs[0].gradients[self], self.A.value)
+
+class Sigmoid(Node):
+    def __init__(self, node):
+        super().__init__([node])
+
+    def forward(self):
+        self.value = 1 / (1 + np.exp(-self.inputs[0].value))
+
+    def backward(self):
+        # Ensure proper broadcasting
+        grad = self.outputs[0].gradients[self]
+        sigmoid_grad = self.value * (1 - self.value)
+        self.gradients[self.inputs[0]] = grad * sigmoid_grad
+
+class BCE(Node):
+    def __init__(self, y_true, y_pred):
+        super().__init__([y_true, y_pred])
+
+    def forward(self):
+        y_true, y_pred = self.inputs
+        # Add epsilon for numerical stability
+        eps = 1e-9
+        self.value = -np.mean(
+            y_true.value * np.log(y_pred.value + eps) +
+            (1 - y_true.value) * np.log(1 - y_pred.value + eps)
+        )
+
+    def backward(self):
+        y_true, y_pred = self.inputs
+        eps = 1e-9
+        m = y_true.value.shape[0]
+        self.gradients[y_pred] = (-(y_true.value / (y_pred.value + eps) -
+                                  (1 - y_true.value) / (1 - y_pred.value + eps))) / m
